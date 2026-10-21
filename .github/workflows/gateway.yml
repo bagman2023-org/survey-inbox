@@ -1,0 +1,55 @@
+name: Engineering Gateway
+run-name: Engineering Gateway ${{ inputs.request_id || github.run_id }}
+on:
+  issues:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Check configuration or process pending requests
+        type: choice
+        options: [check, process]
+        default: check
+      request_id:
+        description: Deployment check correlation identifier
+        type: string
+        required: false
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+permissions:
+  contents: write
+  issues: write
+concurrency:
+  group: engineering-gateway
+  cancel-in-progress: false
+  queue: max
+jobs:
+  process:
+    if: github.repository == 'bagman2023-org/survey-inbox' && (github.event_name == 'workflow_dispatch' || (vars.GATEWAY_ENABLED == 'true' && (github.event_name != 'issues' || (startsWith(github.event.issue.title, 'ENGREQ1:') && github.event.issue.user.login == 'bagman-survey-inbox[bot]'))))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            gateway.py
+            requirements.txt
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13'
+      - run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all: -r requirements.txt
+      - run: python -B gateway.py
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GATEWAY_FORMAL_REPO: bagman2023-org/survey
+          GATEWAY_PRIVATE_KEY: ${{ secrets.GATEWAY_PRIVATE_KEY }}
+          GATEWAY_STATE_KEY: ${{ secrets.GATEWAY_STATE_KEY }}
+          GATEWAY_WRITER_APP_ID: ${{ secrets.GATEWAY_WRITER_APP_ID }}
+          GATEWAY_WRITER_INSTALLATION_ID: ${{ secrets.GATEWAY_WRITER_INSTALLATION_ID }}
+          GATEWAY_WRITER_PRIVATE_KEY: ${{ secrets.GATEWAY_WRITER_PRIVATE_KEY }}
+          GATEWAY_SMTP_USER: ${{ secrets.GATEWAY_SMTP_USER }}
+          GATEWAY_SMTP_PASSWORD: ${{ secrets.GATEWAY_SMTP_PASSWORD }}
