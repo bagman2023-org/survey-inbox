@@ -90,7 +90,11 @@ class MainConfigsGateCryptsStore:
         return (payload+b"."+base64.urlsafe_b64encode(signature).rstrip(b"=")).decode("ascii")
 
 class MainConfigsGateRemoteStore:
-    """仓库访问适配：固定仓库和接口，使用乐观锁提交业务数据及去重记录。"""
+    """仓库访问适配：按接收仓库额度切换凭据，使用乐观锁提交业务及去重记录。"""
+    rate_switch_percent=10
+    rate_cache_seconds=30
+    rate_probe_seconds=30
+    fallback_refresh_seconds=3300
     def __init__(self,formal,inbox,writer_token,inbox_token,state_key,branch="main",inbox_branch="main"):
         for repository in (formal,inbox):
             if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",repository):raise ValueError("仓库名称错误")
@@ -101,13 +105,156 @@ class MainConfigsGateRemoteStore:
         self.branch,self.inbox_branch=branch,inbox_branch
         self.session=requests.Session()
         self.state_sha=""
-    def close(self):self.session.close()
+        self._rate_limits={"builtin":{},"fallback":{}}
+        self._rate_clock_delta=0.0
+        self._next_builtin_probe=0.0
+        self._secondary_until=0.0
+        self._inbox_source=""
+        self._fallback_config=None
+        self._fallback_token=""
+        self._fallback_expires=0.0
+        self._closed=False
+    def close(self):
+        if self._closed:return
+        try:self._revoke_fallback_token()
+        finally:
+            self._fallback_config=None
+            self.session.close();self._closed=True
+    def configure_inbox_fallback(self,app_id,installation_id,private_key,shared_writer=False):
+        if self._closed or self._fallback_token:raise RuntimeError("备用App配置不能在关闭或使用后更换")
+        if not str(app_id).isdigit() or not str(installation_id).isdigit() or not private_key:raise ValueError("云端备用App配置不完整")
+        if not RSA.import_key(private_key).has_private():raise ValueError("云端备用App私钥无效")
+        if not isinstance(shared_writer,bool):raise ValueError("云端App额度归属配置无效")
+        if shared_writer:raise ValueError("云端备用App不得复用管理员写入App")
+        self._fallback_config=(str(app_id),str(installation_id),private_key)
+    def _record_rate_headers(self,source,headers):
+        if source not in self._rate_limits or str(headers.get("X-RateLimit-Resource","core"))!="core":return False
+        try:
+            raw_values=tuple(headers.get(name,"") for name in ("X-RateLimit-Limit","X-RateLimit-Remaining","X-RateLimit-Reset"))
+            if any(not str(raw_value).isdigit() for raw_value in raw_values):return False
+            rate_limit,rate_remaining,rate_reset=map(int,raw_values)
+            if rate_limit<=0 or not 0<=rate_remaining<=rate_limit or rate_reset<=0:return False
+            rate_date=headers.get("Date")
+            if rate_date:
+                try:self._rate_clock_delta=datetime.strptime(rate_date,"%a, %d %b %Y %H:%M:%S GMT").replace(tzinfo=timezone.utc).timestamp()-time.time()
+                except (TypeError,ValueError):pass
+            rate_checked=time.monotonic()
+            self._rate_limits[source]={"limit":rate_limit,"remaining":rate_remaining,"reset":rate_reset,"checked":rate_checked}
+            if source=="builtin":
+                until_reset=rate_reset-time.time()-self._rate_clock_delta
+                probe_delay=until_reset if rate_remaining*100<rate_limit*self.rate_switch_percent else min(self.rate_cache_seconds,until_reset)
+                self._next_builtin_probe=rate_checked+(probe_delay if probe_delay>0 else self.rate_probe_seconds)
+            return True
+        except (AttributeError,TypeError,ValueError,OverflowError):return False
+    def _classify_rate_limit(self,response):
+        if response.status_code not in (403,429):return ""
+        response_headers=response.headers
+        try:
+            response_body=response.json()
+            rate_message=str(response_body.get("message","") if isinstance(response_body,dict) else "").lower()
+        except (TypeError,ValueError):rate_message=""
+        retry_value=response_headers.get("Retry-After")
+        primary_limit=str(response_headers.get("X-RateLimit-Remaining",""))=="0" and "rate limit" in rate_message
+        if retry_value is not None or "secondary" in rate_message or "abuse" in rate_message or (response.status_code==429 and not primary_limit):
+            try:retry_seconds=max(1.0,float(retry_value)) if retry_value is not None else 60.0
+            except (TypeError,ValueError,OverflowError):retry_seconds=60.0
+            if not 0<retry_seconds<float("inf"):retry_seconds=60.0
+            self._secondary_until=max(self._secondary_until,time.monotonic()+retry_seconds)
+            print(f"❌ GitHub二级限流，暂停请求至少{retry_seconds:g}秒，本轮保留请求等待补偿")
+            return "secondary"
+        if primary_limit:return "primary"
+        return "permission"
+    def _probe_rate_limit(self,source):
+        if time.monotonic()<self._secondary_until:raise RuntimeError("GitHub二级限流冷却中，待处理请求已保留")
+        probe_token=self.inbox_token if source=="builtin" else self._get_fallback_token()
+        try:
+            with self.session.get("https://api.github.com/rate_limit",headers={"Authorization":"Bearer "+probe_token,"Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"},timeout=(5,15)) as quota_response:
+                recorded=self._record_rate_headers(source,quota_response.headers)
+                probe_kind=self._classify_rate_limit(quota_response)
+                if probe_kind=="secondary":raise RuntimeError("GitHub额度查询触发二级限流，待处理请求已保留")
+                if quota_response.status_code in (401,403) and probe_kind!="primary":raise RuntimeError(f"GitHub额度查询授权失败 HTTP {quota_response.status_code}")
+                if quota_response.status_code!=200:return recorded if probe_kind=="primary" else False
+                if recorded:return True
+                quota_document=quota_response.json()
+                quota_core=quota_document.get("resources",{}).get("core",{}) if isinstance(quota_document,dict) and isinstance(quota_document.get("resources"),dict) else {}
+                if not isinstance(quota_core,dict):return False
+                return self._record_rate_headers(source,{"X-RateLimit-Resource":"core","X-RateLimit-Limit":quota_core.get("limit"),"X-RateLimit-Remaining":quota_core.get("remaining"),"X-RateLimit-Reset":quota_core.get("reset")})
+        except (requests.RequestException,TypeError,ValueError) as quota_probe_error:
+            print(f"❌ 查询{source}额度失败: {type(quota_probe_error).__name__}")
+            return False
+    def _get_fallback_token(self):
+        if self._fallback_token and time.monotonic()<self._fallback_expires:return self._fallback_token
+        if not self._fallback_config:raise RuntimeError("尚未配置接收仓库的云端备用App")
+        if self._fallback_token:self._revoke_fallback_token()
+        try:self._fallback_token=MainConfigsGateCryptsStore.installation_token(*self._fallback_config,self.inbox)
+        except (requests.RequestException,TypeError,ValueError,RuntimeError) as fallback_token_error:
+            print(f"❌ 获取云端备用App令牌失败: {type(fallback_token_error).__name__}")
+            raise
+        self._fallback_expires=time.monotonic()+self.fallback_refresh_seconds
+        return self._fallback_token
+    def _select_inbox_token(self,force_fallback=False):
+        if self._closed:raise RuntimeError("后台仓库会话已关闭")
+        if time.monotonic()<self._secondary_until:raise RuntimeError("GitHub二级限流冷却中，待处理请求已保留")
+        builtin_rate=self._rate_limits["builtin"]
+        builtin_low=bool(builtin_rate and builtin_rate["remaining"]*100<builtin_rate["limit"]*self.rate_switch_percent)
+        needs_probe=not builtin_rate or builtin_rate["reset"]<=time.time()+self._rate_clock_delta or (not builtin_low and time.monotonic()-builtin_rate["checked"]>=self.rate_cache_seconds)
+        if not force_fallback and needs_probe and time.monotonic()>=self._next_builtin_probe:
+            self._next_builtin_probe=time.monotonic()+self.rate_probe_seconds
+            if not self._probe_rate_limit("builtin"):self._rate_limits["builtin"]={}
+            builtin_rate=self._rate_limits["builtin"]
+        builtin_ready=bool(not force_fallback and builtin_rate and builtin_rate["reset"]>time.time()+self._rate_clock_delta and builtin_rate["remaining"]*100>=builtin_rate["limit"]*self.rate_switch_percent)
+        source="builtin" if builtin_ready else "fallback"
+        if source=="builtin":selected_token=self.inbox_token
+        else:
+            selected_token=self._get_fallback_token()
+            fallback_rate=self._rate_limits["fallback"]
+            if not fallback_rate or fallback_rate["reset"]<=time.time()+self._rate_clock_delta or time.monotonic()-fallback_rate["checked"]>=self.rate_cache_seconds:
+                if not self._probe_rate_limit("fallback"):
+                    self._rate_limits["fallback"]={}
+                    raise RuntimeError("无法核实云端备用App额度，待处理请求已保留")
+                fallback_rate=self._rate_limits["fallback"]
+            if fallback_rate["remaining"]<=0:raise RuntimeError("云端备用App额度已耗尽，待处理请求已保留")
+        if source!=self._inbox_source:
+            if source=="fallback":print("✅ 接收仓库API切换到云端GitHub App额度")
+            elif self._inbox_source:print("✅ 接收仓库API切回Actions内置额度")
+            self._inbox_source=source
+        return selected_token
+    def _revoke_fallback_token(self):
+        owned_token=self._fallback_token
+        self._fallback_token="";self._fallback_expires=0.0
+        if not owned_token:return True
+        try:
+            with self.session.delete("https://api.github.com/installation/token",headers={"Authorization":"Bearer "+owned_token,"Accept":"application/vnd.github+json"},timeout=(10,15)) as revoke_response:
+                if revoke_response.status_code not in (204,401):
+                    print(f"❌ 备用App临时令牌撤销失败 HTTP {revoke_response.status_code}")
+                    return False
+            return True
+        except requests.RequestException as fallback_revoke_error:
+            print(f"❌ 备用App临时令牌撤销失败: {type(fallback_revoke_error).__name__}")
+            return False
     def request(self,method,path,payload=None,inbox=False,accepted=(200,201)):
-        token=self.inbox_token if inbox else self.writer_token
-        with self.session.request(method,"https://api.github.com/"+path.lstrip("/"),headers={"Authorization":"Bearer "+token,"Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"},json=payload,timeout=(10,30)) as response:
-            if response.status_code not in accepted:raise RuntimeError(f"GitHub {method} 请求失败 HTTP {response.status_code}")
-            if response.status_code in (204,404):return None
-            return response.json()
+        fallback_refreshed=False
+        for request_attempt in range(3 if inbox else 1):
+            if self._closed:raise RuntimeError("后台仓库会话已关闭")
+            if time.monotonic()<self._secondary_until:raise RuntimeError("GitHub二级限流冷却中，待处理请求已保留")
+            token=self._select_inbox_token(force_fallback=request_attempt>0) if inbox else self.writer_token
+            source=self._inbox_source if inbox else ""
+            with self.session.request(method,"https://api.github.com/"+path.lstrip("/"),headers={"Authorization":"Bearer "+token,"Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"},json=payload,timeout=(10,30)) as response:
+                if source and not self._record_rate_headers(source,response.headers):
+                    self._rate_limits[source]={}
+                    if source=="builtin":self._next_builtin_probe=time.monotonic()+self.rate_probe_seconds
+                rate_kind=self._classify_rate_limit(response)
+                if rate_kind=="secondary":raise RuntimeError("GitHub二级限流，待处理请求已保留")
+                if response.status_code==401 and inbox and source=="fallback" and not fallback_refreshed and request_attempt<2:
+                    self._fallback_expires=0.0;self._rate_limits["fallback"]={};fallback_refreshed=True
+                    continue
+                if rate_kind=="primary":
+                    if inbox and source=="builtin" and request_attempt==0:continue
+                    raise RuntimeError("GitHub主额度已耗尽，待处理请求已保留")
+                if response.status_code not in accepted:raise RuntimeError(f"GitHub {method} 请求失败 HTTP {response.status_code}")
+                if response.status_code in (204,404):return None
+                return response.json()
+        raise RuntimeError("GitHub请求未完成，待处理请求已保留")
     def read_file(self,path,ref=None,inbox=False):
         repository=self.inbox if inbox else self.formal
         suffix="?ref="+requests.utils.quote(ref,safe="") if ref else ""
@@ -511,16 +658,26 @@ class MainConfigsGateWorkerStore:
     def main(cls):
         state_key=MainConfigsGateCryptsStore.decode(os.environ["GATEWAY_STATE_KEY"])
         if len(state_key)!=32:raise ValueError("后台状态密钥长度错误")
+        fallback_app_id=os.environ.get("GATEWAY_FALLBACK_APP_ID","").strip()
+        fallback_installation_id=os.environ.get("GATEWAY_FALLBACK_INSTALLATION_ID","").strip()
+        fallback_private_key=os.environ.get("GATEWAY_FALLBACK_PRIVATE_KEY","")
+        if not fallback_app_id.isdigit() or not fallback_installation_id.isdigit() or not fallback_private_key:raise ValueError("独立云端备用App配置不完整")
+        if fallback_app_id==str(os.environ["GATEWAY_WRITER_APP_ID"]).strip() or fallback_installation_id==str(os.environ["GATEWAY_WRITER_INSTALLATION_ID"]).strip():raise ValueError("云端备用App不得复用管理员写入App")
+        if RSA.import_key(fallback_private_key).public_key().export_key()==RSA.import_key(os.environ["GATEWAY_WRITER_PRIVATE_KEY"]).public_key().export_key():raise ValueError("云端备用App必须使用独立私钥")
         writer_token=MainConfigsGateCryptsStore.installation_token(os.environ["GATEWAY_WRITER_APP_ID"],os.environ["GATEWAY_WRITER_INSTALLATION_ID"],os.environ["GATEWAY_WRITER_PRIVATE_KEY"],os.environ["GATEWAY_FORMAL_REPO"])
-        remote=MainConfigsGateRemoteStore(os.environ["GATEWAY_FORMAL_REPO"],os.environ["GITHUB_REPOSITORY"],writer_token,os.environ["GITHUB_TOKEN"],state_key)
+        remote=None
         try:
+            remote=MainConfigsGateRemoteStore(os.environ["GATEWAY_FORMAL_REPO"],os.environ["GITHUB_REPOSITORY"],writer_token,os.environ["GITHUB_TOKEN"],state_key)
+            remote.configure_inbox_fallback(fallback_app_id,fallback_installation_id,fallback_private_key)
             worker=cls(remote,os.environ["GATEWAY_PRIVATE_KEY"],state_key,cls.send_mail)
             with open(os.environ["GITHUB_EVENT_PATH"],encoding="utf-8") as event_stream:event=json.load(event_stream)
             if os.environ.get("GITHUB_EVENT_NAME")=="workflow_dispatch" and event.get("inputs",{}).get("operation")=="check":
+                remote._get_fallback_token()
+                if not remote._probe_rate_limit("builtin") or not remote._probe_rate_limit("fallback"):raise RuntimeError("后台额度来源检查未通过")
                 for filename in ("github_project_users.json","github_project_cards.json","github_project_stats.json"):
                     if remote.read_json(filename) is None:raise ValueError("正式仓库资料缺失")
                 with smtplib.SMTP_SSL("smtp.qq.com",465,timeout=20,context=ssl.create_default_context()) as smtp:smtp.login(os.environ["GATEWAY_SMTP_USER"],os.environ["GATEWAY_SMTP_PASSWORD"])
-                print("Gateway configuration and SMTP authentication verified; no email sent")
+                print("Gateway configuration, quota credentials and SMTP authentication verified; no email sent")
                 return
             previous_state=MainConfigsGateCryptsStore.encode(worker.state)
             worker.prune()
@@ -552,14 +709,17 @@ class MainConfigsGateWorkerStore:
                 if processed>=30 or time.monotonic()-started>=480:break
             print(f"Gateway processed {processed} requests")
         finally:
+            cleanup_session=remote.session if remote is not None else requests.Session()
             try:
-                with remote.session.delete("https://api.github.com/installation/token",headers={"Authorization":"Bearer "+writer_token,"Accept":"application/vnd.github+json"},timeout=(10,15)) as response:
+                with cleanup_session.delete("https://api.github.com/installation/token",headers={"Authorization":"Bearer "+writer_token,"Accept":"application/vnd.github+json"},timeout=(10,15)) as response:
                     if response.status_code!=204:print(f"❌ Temporary writer token revocation returned HTTP {response.status_code}")
             except requests.RequestException as revoke_error:print(f"❌ Temporary writer token revocation failed: {type(revoke_error).__name__}")
-            finally:remote.close()
+            finally:
+                if remote is not None:remote.close()
+                else:cleanup_session.close()
 
 if __name__=="__main__":
     try:MainConfigsGateWorkerStore.main()
     except (OSError,ValueError,TypeError,KeyError,RuntimeError,requests.RequestException,smtplib.SMTPException) as gateway_error:
-        print(f"❌ Gateway failed: {type(gateway_error).__name__}",file=sys.stderr)
+        print(f"❌ Gateway failed: {str(gateway_error) if isinstance(gateway_error,(RuntimeError,ValueError)) and not isinstance(gateway_error,requests.RequestException) else type(gateway_error).__name__}",file=sys.stderr)
         raise SystemExit(1)
